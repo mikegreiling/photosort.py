@@ -49,11 +49,21 @@ def main():
 	
 	(action, src, dest) = args
 	
+	# ensure source and destination both exist and are directories
+	for path in (src, dest):
+		if not os.path.isdir(path):
+			parser.error("No such file or directory '%s'" % path)
+	
 	# handle sort action
 	if action == 'sort':
 		if not options.name:
 			options.name = os.path.basename(os.path.abspath(src))
-		sort_images(src, dest, options.name, options.move, options.verbose)
+		
+		name = unique_name(options.name, dest)
+		if name != options.name:
+			print "[WARNING] A file or directory named '%s' already exists at '%s'. Using '%s' instead." % (options.name, dest, name)
+		
+		sort_images(src, dest, name, options.move, options.verbose)
 	
 	# handle restore action
 	if action == 'restore':
@@ -86,6 +96,39 @@ def fix_images(src, dest, move=False, verbose=True):
 	'''
 	print "Fixing Image Dates..."
 
+
+def assert_dir(dirs, message=None):
+	'''
+	ensures a directory exists at each path specified in dirs.
+	
+	raises an exception if a directory does not exist and it is unable to create one.
+	'''
+	if not type(dirs) == list:
+		dirs = [dirs]
+	for dir in dirs:
+		try:
+			os.makedirs(dir)
+		except OSError:
+			if not os.path.isdir(dir):
+				if not message:
+					message = "Unable to create needed directory ('%s')" % dir
+				raise IOError(message)
+
+
+def unique_name(name, path):
+	'''
+	return a non-existing file or directory name within a given path
+	
+	if a suggested name already exists, appends a number to it to make it unique
+	'''
+	i = 1
+	assert_dir(path)
+	dir_list = [x.lower() for x in os.listdir(path)]
+	root, ext = os.path.splitext(name)
+	while name.lower() in dir_list:
+		name = root + '-' + str(i) + ext
+		i += 1
+	return name
 
 
 if __name__ == "__main__":
