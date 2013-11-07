@@ -1,0 +1,5 @@
+# ignore everything except photosort.py
+*
+!.gitignore
+!photosort.py
+
