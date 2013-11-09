@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 
-import os, sys
+import os, sys, re, glob, shutil, hashlib, subprocess
+from optparse import OptionParser
+from datetime import datetime
+from PIL import Image, ExifTags
 
 def main():
 	'''
@@ -86,7 +89,46 @@ def sort_images(src, dest, src_bucket, move=False, verbose=True):
 	prefix = "\nSOURCE: %s\n" % src_bucket
 	log = logger(logfile, verbose, prefix)
 	
-	log("Sorting Images...\n\n...\n")
+	# ensure the source and destination exist
+	if not os.path.isdir(src) or not os.path.isdir(dest):
+		raise IOError('Source or destination directory not found')
+	
+	# ensure the destination bucket exists
+	assert_dir(dest+'/'+src_bucket, "Unable to create needed directories within destination ('%s')" % dest)
+	
+	# capture all directory names within dest path, ensure src_bucket is last in the list
+	buckets = filter(lambda name: os.path.isdir(dest + '/' + name), os.listdir(dest))
+	buckets.remove(src_bucket)
+	buckets += [src_bucket]
+	
+	log("Reading from '%s' (%s)...\n" % (src, src_bucket))
+	log("Sorting Images...\n")
+	
+	# iterate through all files within src
+	files = get_all_files(src)
+	
+	for filepath in files:
+		# capture filename and extension
+		filename = os.path.basename(filepath)
+		extension = os.path.splitext(filename)[1].lower()
+		
+		# generate local file path
+		relpath = re.sub('^%s/?' % src, '', filepath)
+		
+		# attempt to obtain file meta-data
+		filemeta = get_file_metadata(filepath)
+		filehash = get_file_hash(filepath)[:6:]
+		
+		if not filemeta:
+			# file is not an image
+			log('Non-Image Found: %s' % relpath)
+			log('- hash: %s' % filehash)
+		else:
+			# file is an image
+			date = filemeta['date_taken'] or filemeta['file']['mtime']
+			log('Image Found: %s' % relpath)
+			log('- hash: %s' % filehash)
+			log('- date: %s' % date.strftime('%Y/%m/%d %H.%M.%S'))
 
 
 def restore_images(src, dest, move=False, verbose=True):
@@ -143,6 +185,117 @@ def unique_name(name, path):
 		name = root + '-' + str(i) + ext
 		i += 1
 	return name
+
+
+def get_all_files(dir):
+	'''
+	returns a list of all file paths relative to `dir`
+	'''
+	all = []
+	for root, dirs, files in os.walk(dir):
+		all += map(lambda file: root + '/' + file, files)
+	return all
+
+
+def get_file_metadata(filename):
+	'''
+	returns a all available file metadata if file is an image, or None if non-image
+	'''
+	# return none if the file is not an image
+	try:
+		img = Image.open(filename)
+		width, height = img.size
+	except (IOError):
+		return None
+	
+	# check for image type and jpeg file integrity
+	jpeginfo = subprocess.Popen('jpeginfo -c "%s"' % filename, stdout=subprocess.PIPE, shell=True).stdout.read()
+	
+	# if the image is a jpeg file, get more info
+	if 'not a jpeg file' not in jpeginfo.lower():
+		status = re.search("\[([^\[]*)\]", jpeginfo)
+		status = status.group(1) if status else 'UNKNOWN'
+		if status == 'OK':
+			corrupt = 0
+		elif status == 'WARNING':
+			corrupt = 2
+		elif status == 'ERROR':
+			corrupt = 3
+		else:
+			corrupt = 1
+		
+		# collect EXIF data
+		try:
+			exif = img._getexif() or {}
+			meta = {
+				ExifTags.TAGS[k]: v
+				for k, v in exif.items()
+				if k in ExifTags.TAGS
+			}
+		except (IndexError, AttributeError):
+			if corrupt < 2:
+				status = 'META_ERROR'
+				corrupt = 3
+				meta = {}
+	else:
+		status = 'UNKNOWN'
+		corrupt = 1
+		meta = {}
+	
+	# process and format all exif dates
+	try:
+		if 'DateTime' in meta:
+			meta['DateTime'] = datetime.strptime(meta['DateTime'], '%Y:%m:%d %H:%M:%S')
+		else:
+			meta['DateTime'] = None
+		
+		if 'DateTimeOriginal' in meta:
+			meta['DateTimeOriginal'] = datetime.strptime(meta['DateTimeOriginal'], '%Y:%m:%d %H:%M:%S')
+		else:
+			meta['DateTimeOriginal'] = None
+		
+		if 'DateTimeDigitized' in meta:
+			meta['DateTimeDigitized'] = datetime.strptime(meta['DateTimeDigitized'], '%Y:%m:%d %H:%M:%S')
+		else:
+			meta['DateTimeDigitized'] = None
+	except (TypeError, ValueError):
+		meta['DateTime'] = None
+		meta['DateTimeOriginal'] = None
+		meta['DateTimeDigitized'] = None
+	
+	# compile all available image information
+	info = {
+		'hdr':     int(meta['CustomRendered']) if 'CustomRendered' in meta else 0,
+		'width':   width,
+		'height':  height,
+		'status':  status,
+		'corrupt': corrupt,
+		'date_taken':     meta['DateTimeOriginal'],
+		'date_modified':  meta['DateTime'],
+		'date_digitized': meta['DateTimeDigitized'],
+		'file': {
+			'ctime': datetime.fromtimestamp(os.path.getctime(filename)),
+			'mtime': datetime.fromtimestamp(os.path.getmtime(filename)),
+			'atime': datetime.fromtimestamp(os.path.getatime(filename))
+		},
+		'meta': meta
+	}
+	
+	return info
+
+
+def get_file_hash(filepath, blocksize=65536):
+	'''
+	return a md5 hash hex string of the target file
+	'''
+	afile = open(filepath, 'rb')
+	hasher = hashlib.md5()
+	buf = afile.read(blocksize)
+	while len(buf) > 0:
+		hasher.update(buf)
+		buf = afile.read(blocksize)
+	afile.close()
+	return hasher.hexdigest()
 
 
 def logger(path, verbose=True, mirror_pretext=None):
