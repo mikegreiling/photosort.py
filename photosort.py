@@ -16,16 +16,20 @@ def main():
 	usage = "Usage: %s [options] action source dest" % prog
 	
 	parser = optparse.OptionParser(usage)
-	parser.add_option("-c", "--copy",    dest="move",    action="store_true",  help="copy files to destination [default]")
-	parser.add_option("-m", "--move",    dest="move",    action="store_false", help="move files to destination")
+	parser.add_option("-c", "--copy",    dest="copy",    action="store_true",  help="copy files to destination [default]")
+	parser.add_option("-m", "--move",    dest="copy",    action="store_false", help="move files to destination")
 	parser.add_option("-v", "--verbose", dest="verbose", action="store_true")
 	parser.add_option("-q", "--quiet",   dest="verbose", action="store_false")
 	
 	# sort action options
 	group = optparse.OptionGroup(parser, "Sort Photos", "Usage: %s [options] sort source dest" % prog)
-	group.add_option("-n", "--name",     dest="name",     help="specify a bucket name for this image source (default is the source directory name)", metavar="NAME")
-	group.add_option("-p", "--preserve", dest="preserve", action="store_true",  help="keep all alternates including low-res and duplicates [default]")
-	group.add_option("-d", "--discard",  dest="preserve", action="store_false", help="discard duplicates and low-res alternates.")
+	group.add_option("-n", "--name",      dest="name",     help="specify a bucket name for this image source (default is the source directory name)", metavar="NAME")
+	group.add_option("-p", "--preserve",  dest="preserve", action="store_true",  help="keep all alternates including low-res and duplicates [default]")
+	group.add_option("-d", "--discard",   dest="preserve", action="store_false", help="discard duplicates and low-res alternates.")
+	group.add_option("-t", "--trusted",   dest="trust",    action="store_true",  help="trust this source to displace existing sources [default]")
+	group.add_option("-u", "--untrusted", dest="trust",    action="store_false", help="do not displace existing sources, treat as potentialy corrupt.")
+	group.add_option("-j", "--combine",   dest="combine",  action="store_true",  help="combine identical images into one file [default]")
+	group.add_option("-s", "--separate",  dest="combine",  action="store_false", help="treat identical images as alternates.")
 	parser.add_option_group(group)
 	
 	# restore action options
@@ -37,7 +41,7 @@ def main():
 	parser.add_option_group(group)
 	
 	# parse our options
-	parser.set_defaults(verbose=True, move=False, preserve=True)
+	parser.set_defaults(verbose=True, copy=True, preserve=True, combine=True, trust=True)
 	(options, args) = parser.parse_args()
 	
 	if len(args) == 0:
@@ -68,18 +72,18 @@ def main():
 		if name != options.name:
 			print "[WARNING] A file or directory named '%s' already exists at '%s'. Using '%s' instead." % (options.name, dest, name)
 		
-		sort_images(src, dest, name, options.move, options.verbose)
+		sort_images(src, dest, name, options.copy, options.combine, options.trust, options.preserve, options.verbose)
 	
 	# handle restore action
 	if action == 'restore':
-		restore_images(src, dest, options.move, options.verbose)
+		restore_images(src, dest, options.copy, options.verbose)
 	
 	# handle fix action
 	if action == 'fix':
-		fix_images(src, dest, options.move, options.verbose)
+		fix_images(src, dest, options.copy, options.verbose)
 
 
-def sort_images(src, dest, src_bucket, move=False, verbose=True):
+def sort_images(src, dest, src_bucket, copy=True, combine=True, trusted=True, preserve=True, verbose=True):
 	'''
 	sort images within src to labeled buckets within dest
 	'''
@@ -88,6 +92,9 @@ def sort_images(src, dest, src_bucket, move=False, verbose=True):
 	logfile = dest + '/' + src_bucket + '/_sort.log.txt'
 	prefix = "\nSOURCE: %s\n" % src_bucket
 	log = logger(logfile, verbose, prefix)
+	
+	# generate our move closure
+	move = mover(copy)
 	
 	# ensure the source and destination exist
 	if not os.path.isdir(src) or not os.path.isdir(dest):
@@ -106,6 +113,17 @@ def sort_images(src, dest, src_bucket, move=False, verbose=True):
 	
 	# iterate through all files within src
 	files = get_all_files(src)
+	tally = {
+		'files': 0,
+		'file_match': 0,
+		'meta_match_rep': 0,
+		'meta_match_unk': 0,
+		'meta_match_low': 0,
+		'meta_match_alt': 0,
+		'no_match': 0,
+		'no_meta': 0,
+		'corrupt': 0
+	}
 	
 	for filepath in files:
 		# capture filename and extension
@@ -119,19 +137,193 @@ def sort_images(src, dest, src_bucket, move=False, verbose=True):
 		filemeta = get_file_metadata(filepath)
 		filehash = get_file_hash(filepath)[:6:]
 		
-		if not filemeta:
-			# file is not an image
-			log('Non-Image Found: %s' % relpath)
-			log('- hash: %s' % filehash)
-		else:
+		if filemeta:
 			# file is an image
-			date = filemeta['date_taken'] or filemeta['file']['mtime']
-			log('Image Found: %s' % relpath)
-			log('- hash: %s' % filehash)
-			log('- date: %s' % date.strftime('%Y/%m/%d %H.%M.%S'))
+			if filemeta['date_taken']:
+				date = filemeta['date_taken']
+				metapath = '/exif'
+			else:
+				date = filemeta['file']['mtime']
+				metapath = '/noexif'
+			
+			# generate match-string for the image
+			res = sorted((filemeta['width'], filemeta['height']))
+			subpath = date.strftime('/%Y/%m')
+#			matchmeta = date.strftime('%Y.%m.%d %H.%M.%S-') + str(filemeta['hdr'])
+			matchmeta = date.strftime('%Y.%m.%d %H.%M.%S-') + '%s %s' % (str(filemeta['hdr']), filemeta['signature'][0:4])
+			matchfile = matchmeta + ' %04dx%04d %s %s' % (res[1], res[0], filemeta['status'], filehash)
+			
+			# tally corrupted files
+			if filemeta['corrupt'] > 1:
+				tally['corrupt'] += 1
+			
+			# look for matches within each source bucket
+			for bucket in buckets:
+				sortbase = bucket + metapath + subpath
+				logfiles = [dest + '/' + sortbase + '/_sort.log.txt']
+				matches = glob.glob('/'.join((dest, sortbase, matchmeta)) + '*')
+				
+				if matches:
+					# metadata match found
+					# get minimum resolution from the match(es)
+					def parse_res(s):
+						m = re.search(" (\d{4})x(\d{4}) ", s)
+						if m:
+							return int(m.group(1)) * int(m.group(2))
+						return -1
+					
+					replacefile = None
+					min_res = min([parse_res(os.path.basename(match)) for match in matches])
+					
+					# compare photo resolutions
+					if bucket != src_bucket:
+						if filemeta['width'] * filemeta['height'] > min_res:
+							# higher resolution image found
+							if len(matches) > 1 and bucket != src_bucket:
+								subpath = '/unk'
+							elif not trusted or filemeta['corrupt']:
+								subpath = '/alt'
+							else:
+								replacefile = matches[0]
+						else:
+							# lower or equal resolution image found
+							subpath = '/low'
+						
+						# extract the canonical filename from our matched image
+						canonical = re.search("\[([^\[]*)\]", os.path.basename(matches[0]))
+						if canonical:
+							filename = canonical.group(1)
+							if len(matches) > 1:
+								filename = '?' + filename
+						
+						# log this in the corresponding bucket as well
+						logfiles.append(dest + '/' + bucket + '/_sort.log.txt')
+					
+					# set our new sortbase if necessary
+					sortbase = bucket + metapath + subpath
+					
+					# search for identical copies
+					if combine:
+						matches += glob.glob('/'.join((dest, sortbase, matchmeta)) + '*')
+						identical = [match for match in matches if os.path.basename(match).startswith(matchfile)]
+						if identical:
+							# identical file found
+							# add src_bucket to the list of sources within the filename
+							rename = identical[0].split('].')
+							sources = rename.pop().split('.')
+							rename_ext = sources.pop()
+							
+							for i, source in enumerate(sources):
+								if source == src_bucket:
+									sources[i] = src_bucket + '(x2)'
+									break
+								m = re.search("^(.*)\(x(\d*)\)$", source)
+								if m and m.group(1) == src_bucket:
+									sources[i] = '%s(x%d)' % (src_bucket, int(m.group(2)) + 1)
+									break
+							else:
+								sources.append(src_bucket)
+							rename = '].'.join(rename + ['.'.join(sources + [rename_ext])])
+							
+							# log this action
+							log('File-Match : %s [MOVED TO] %s' % (relpath, rename[len(dest)+1::]), logfiles)
+							log('             [RENAMED] %s' % identical[0][len(dest)+1::], logfiles)
+							
+							# rename the file and delete the duplicate if we're not copying
+							move(identical[0], rename, copy=False)
+							if not copy:
+								os.unlink(filepath)
+							tally['file_match'] += 1
+							break
+					
+					# remove lower resolution images if they aren't duplicates of anything else
+					if subpath == '/low' and not preserve:
+						if not copy:
+							os.unlink(filepath)
+						log('Meta-Match : %s [REMOVED]' % relpath, logfiles)
+						break
+					
+					# compile our new filename
+					sortname = unique_name(matchfile + ' [%s].%s%s' % (filename, src_bucket, extension), dest + '/' + sortbase)
+					sortpath = sortbase + '/' + sortname
+					
+					# log this action
+					if bucket == src_bucket:
+						log('  No-Match : %s [MOVED TO] %s' % (relpath, sortpath), logfiles)
+					else:
+						log('Meta-Match : %s [MOVED TO] %s' % (relpath, sortpath), logfiles)
+					
+					# move or copy file to the appropriate subfolder within this bucket
+					move(filepath, dest + '/' + sortpath)
+					
+					# are we replacing a canonical photo?
+					if replacefile:
+						if preserve:
+							# log this action and move replaced photo into /low
+							replacepath = bucket + metapath + '/low'
+							replacepath += '/' + unique_name(os.path.basename(replacefile), dest + '/' + replacepath)
+							log('             [REPLACED] %s/%s [TO] %s' % (sortbase, os.path.basename(replacefile), replacepath), logfiles)
+							move(replacefile, dest + '/' + replacepath, copy=False)
+						else:
+							# log this action and delete the replaced photo
+							log('             [REPLACED] %s/%s' % (sortbase, os.path.basename(replacefile)), logfiles)
+							os.unlink(replacefile)
+					
+					if bucket == src_bucket:
+						tally['no_match'] += 1
+					elif subpath == '/low':
+						tally['meta_match_low'] += 1
+					elif subpath == '/unk':
+						tally['meta_match_unk'] += 1
+					elif subpath == '/alt':
+						tally['meta_match_alt'] += 1
+					else:
+						tally['meta_match_rep'] += 1
+					break
+			else:
+				# no metadata match found
+				sortbase = src_bucket + metapath + subpath
+				sortname = matchfile + ' [%s].%s%s' % (filename, src_bucket, extension)
+				sortpath = sortbase + '/' + sortname
+				
+				# log this action
+				logfile = dest + '/' + sortbase + '/_sort.log.txt'
+				log('  No-Match : %s [MOVED TO] %s' % (relpath, sortpath), logfile)
+				
+				# move or copy file to the appropriate subfolder within this source's bucket
+				move(filepath, dest + '/' + sortpath)
+				tally['no_match'] += 1
+		else:
+			# file is not an image
+			sortbase = src_bucket + '/noimage'
+			sortpath = sortbase + '/' + relpath
+			
+			# log this action
+			logfile = dest + '/' + sortbase + '/_sort.log.txt'
+			log(' Non-Image : %s [MOVED TO] %s' % (relpath, sortpath), logfile)
+			
+			# move or copy file to 'noimage' subfolder within this source's bucket
+			move(filepath, dest + '/' + sortpath)
+			tally['no_meta'] += 1
+		
+		tally['files'] += 1
+	
+	# print final tallies
+	log("\n------------------------")
+	log("%4d Unmatched Files" % tally['no_match'])
+	log("%4d Exact Matches" % tally['file_match'])
+	log("%4d Replaced Meta Matches" % tally['meta_match_rep'])
+	log("%4d Alternate Meta Matches" % tally['meta_match_alt'])
+	log("%4d Unknown Meta Matches" % tally['meta_match_unk'])
+	log("%4d Lower Quality Meta Matches" % tally['meta_match_low'])
+	log("------------------------")
+	log("%4d Corrupt Files Encountered" % tally['corrupt'])
+	log("------------------------")
+	log("%4d Non-Images" % tally['no_meta'])
+	log("%4d Total Files Processed" % tally['files'])
+	log("------------------------\n\n\n")
 
-
-def restore_images(src, dest, move=False, verbose=True):
+def restore_images(src, dest, copy=True, verbose=True):
 	'''
 	restore image filenames generated by sort_images
 	'''
@@ -142,7 +334,7 @@ def restore_images(src, dest, move=False, verbose=True):
 	log("Restoring Filenames...\n\n...\n")
 
 
-def fix_images(src, dest, move=False, verbose=True):
+def fix_images(src, dest, copy=True, verbose=True):
 	'''
 	correct image date metadata
 	'''
@@ -213,7 +405,7 @@ def get_file_metadata(filename):
 	
 	# if the image is a jpeg file, get more info
 	if 'not a jpeg file' not in jpeginfo.lower():
-		status = re.search("\[([^\[]*)\]", jpeginfo)
+		status = re.search("\[([^\]]*)\][^\[]*$", jpeginfo)
 		status = status.group(1) if status else 'UNKNOWN'
 		if status == 'OK':
 			corrupt = 0
@@ -263,13 +455,26 @@ def get_file_metadata(filename):
 		meta['DateTimeOriginal'] = None
 		meta['DateTimeDigitized'] = None
 	
+	# generate a psudo-unique signature using obscure exif data
+	sign = ''
+	sign += str(meta['Make']) if 'Make' in meta else ''
+	sign += str(meta['Model']) if 'Model' in meta else ''
+	if 'FocalLength' in meta and len(meta['FocalLength']) >= 2:
+		sign += ' %1.4f' % (float(meta['FocalLength'][0]) / float(meta['FocalLength'][1]))
+	if 'ExposureTime' in meta and len(meta['ExposureTime']) >= 2:
+		sign += ' %1.4f' % (float(meta['ExposureTime'][0]) / float(meta['ExposureTime'][1]))
+	if 'ApertureValue' in meta and len(meta['ApertureValue']) >= 2:
+		sign += ' %1.4f' % (float(meta['ApertureValue'][0]) / float(meta['ApertureValue'][1]))
+	sign = hashlib.md5(sign).hexdigest()
+	
 	# compile all available image information
 	info = {
 		'hdr':     int(meta['CustomRendered']) if 'CustomRendered' in meta else 0,
-		'width':   width,
-		'height':  height,
+		'width':   int(width),
+		'height':  int(height),
 		'status':  status,
 		'corrupt': corrupt,
+		'signature': sign,
 		'date_taken':     meta['DateTimeOriginal'],
 		'date_modified':  meta['DateTime'],
 		'date_digitized': meta['DateTimeDigitized'],
@@ -298,11 +503,37 @@ def get_file_hash(filepath, blocksize=65536):
 	return hasher.hexdigest()
 
 
+def mover(copy_default=True):
+	'''
+	return a function which can be used to move files, enclosing the provided parameters.
+	'''
+	def move(src, dest, copy=None, overwrite=False):
+		# ensure the destination directory exists
+		assert_dir(os.path.dirname(dest))
+		
+		# ensure the source file exists and the destination file does not
+		if not os.path.isfile(src):
+			raise Exception("No such file exists ('%s')" % src)
+		if not overwrite and os.path.isfile(dest):
+			raise Exception("File already exists ('%s')" % dest)
+		
+		# allow copy param to override default copy/move setting
+		if copy or (copy_default and copy != False):
+			# copy file and stats
+			shutil.copyfile(src, dest)
+			shutil.copystat(src, dest)
+		else:
+			# move file and copy stats
+			stat = os.stat(src)
+			shutil.move(src, dest)
+			os.utime(dest, (stat.st_atime, stat.st_mtime))
+	return move
+
+
 def logger(path, verbose=True, mirror_pretext=None):
 	'''
 	return a function which can be used to append to logs, enclosing the provided parameters.
 	'''
-	assert_dir(os.path.dirname(path))
 	used = [path]
 	
 	def log(message, mirrors=None, echo=None):
@@ -318,6 +549,7 @@ def logger(path, verbose=True, mirror_pretext=None):
 		
 		logfiles = [path] + mirrors
 		for logfile in logfiles:
+			assert_dir(os.path.dirname(logfile))
 			with open(logfile, 'a') as res:
 				if not (logfile in used):
 					used.append(logfile)
