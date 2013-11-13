@@ -38,10 +38,11 @@ def main():
 	
 	# fix action options
 	group = optparse.OptionGroup(parser, "Fix Photo Dates", "Usage: %s [options] fix source [dest]" % prog)
+	group.add_option("-z", "--test", dest="test", action="store_true", help="perform a test run (do not modify anything)")
 	parser.add_option_group(group)
 	
 	# parse our options
-	parser.set_defaults(verbose=True, copy=True, preserve=True, combine=True, trust=True)
+	parser.set_defaults(verbose=True, copy=True, preserve=True, combine=True, trust=True, test=False)
 	(options, args) = parser.parse_args()
 	
 	if len(args) == 0:
@@ -80,7 +81,7 @@ def main():
 	
 	# handle fix action
 	if action == 'fix':
-		fix_images(src, dest, options.copy, options.verbose)
+		fix_images(src, dest, options.copy, options.verbose, options.test)
 
 
 def sort_images(src, dest, src_bucket, copy=True, combine=True, trusted=True, preserve=True, verbose=True):
@@ -413,15 +414,107 @@ def restore_images(src, dest, copy=True, verbose=True):
 	log("------------------------\n\n\n")
 
 
-def fix_images(src, dest, copy=True, verbose=True):
+def fix_images(src, dest, copy=True, verbose=True, test=True):
 	'''
 	correct image date metadata
+	
+	TO DO: ensure exiv2 is installed `brew install exiv2`
 	'''
+	
+	# ensure the source and destination exist
+	if not os.path.isdir(src) or not os.path.isdir(dest):
+		raise IOError('Source or destination directory not found')
 	
 	# generate our log closure
 	log = logger(dest + '/_fix.log.txt', verbose)
 	
-	log("Fixing Image Dates...\n\n...\n")
+	# generate our move closure
+	if (src == dest):
+		copy = False
+	move = mover(copy)
+	
+	if test:
+		def log(x, *y): print x
+		def move(*x): pass
+	
+	# iterate through all files within src
+	files = get_all_files(src)
+	tally = {
+		'files': 0,
+		'skipped': 0,
+		'fixed': 0,
+		'noimage': 0
+	}
+	
+	# to prevent recursion don't write the log file until we've listed our files
+	log("Reading from '%s'...\n" % (src))
+	log("Fixing Image Dates%s...\n" % (' (Test Run)' if test else ''))
+	
+	for filepath in files:
+		# generate relative file path
+		relpath = os.path.dirname(re.sub('^%s/?' % src, '', filepath))
+		destpath = (dest + '/' + relpath) if relpath else dest
+		filename = os.path.basename(filepath)
+		modpath = destpath + '/' + filename
+		
+		# move/copy the source to the destination
+		if src != dest:
+			filename = unique_name(filename, destpath)
+			move(filepath, destpath + '/' + filename)
+		
+		# attempt to obtain file meta-data
+		filemeta = get_file_metadata(filepath)
+		
+		# ensure file is an image
+		if filemeta:
+			subdir = os.path.basename(os.path.dirname(filepath))
+			
+			# check whether it needs to be "fixed"
+			if subdir != '_backup' and not filemeta['date_taken'] and filemeta['date_modified'] and filemeta['date_modified'] > filemeta['file']['mtime']:
+				# log our attempt to fix this image
+				log('    Fixing : %s (exif: %s [TO] mtime: %s)' % (modpath, filemeta['date_modified'], filemeta['file']['mtime']))
+				
+				if not test:
+					# copy the file to '/backup' directory
+					backupname = unique_name(filename, destpath + '/_backup')
+					move(filepath, destpath + '/_backup/' + backupname, copy=True)
+					
+					# copy filesystem metadata
+					stat = os.stat(modpath)
+					
+					# modify EXIF data
+					# if 'Exif.Image.DateTime' in run_cmd('exiv2 -g "Exif.Image.DateTime" "%s"' % modpath):
+					val = filemeta['file']['mtime'].strftime('%Y:%m:%d %H:%M:%S')
+					run_cmd('exiv2 -M "set Exif.Image.DateTime Ascii %s" "%s"' % (val, modpath))
+					
+					# modify XMP data if necessary
+					if 'Xmp.xmp.ModifyDate' in run_cmd('exiv2 -g "Xmp.xmp.ModifyDate" "%s"' % modpath):
+						val = filemeta['file']['mtime'].strftime('%Y-%m-%dT%H:%M:%S')
+						run_cmd('exiv2 -M "set Xmp.xmp.ModifyDate %s" "%s"' % (val, modpath))
+					
+					# reapply original filesystem metadata
+					os.utime(modpath, (stat.st_atime, stat.st_mtime))
+				
+				tally['fixed'] += 1
+			else:
+				# no fix needed, log as a 'skipped' file
+				log('   Skipped : %s' % modpath)
+				tally['skipped'] += 1
+		else:
+			# not an image, log as a 'non-image' file
+			log(' Non-Image : %s' % modpath)
+			tally['noimage'] += 1
+		
+		tally['files'] += 1
+		
+	# print final tallies
+	log("\n------------------------")
+	log("%4d Fixed Images" % tally['fixed'])
+	log("%4d Skipped Images" % tally['skipped'])
+	log("%4d Non-Image Files" % tally['noimage'])
+	log("------------------------")
+	log("%4d Total Files Processed" % tally['files'])
+	log("------------------------\n\n\n")
 
 
 def assert_dir(dirs, message=None):
