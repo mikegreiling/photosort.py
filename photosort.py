@@ -480,7 +480,7 @@ def get_file_metadata(filename):
 		return None
 	
 	# check for image type and jpeg file integrity
-	jpeginfo = subprocess.Popen('jpeginfo -c "%s"' % filename, stdout=subprocess.PIPE, shell=True).stdout.read()
+	jpeginfo = run_cmd('jpeginfo -c "%s"' % filename)
 	
 	# if the image is a jpeg file, get more info
 	if 'not a jpeg file' not in jpeginfo.lower():
@@ -566,6 +566,12 @@ def get_file_metadata(filename):
 	}
 	
 	return info
+
+def run_cmd(command):
+	'''
+	run the provided shell command and return the result
+	'''
+	return subprocess.Popen(command, stdout=subprocess.PIPE, shell=True).stdout.read()
 
 
 def get_file_hash(filepath, blocksize=65536):
