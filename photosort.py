@@ -449,12 +449,12 @@ def unique_name(name, path):
 	if a suggested name already exists, appends a number to it to make it unique
 	'''
 	i = 1
-	assert_dir(path)
-	dir_list = [x.lower() for x in os.listdir(path)]
-	root, ext = os.path.splitext(name)
-	while name.lower() in dir_list:
-		name = root + '-' + str(i) + ext
-		i += 1
+	if os.path.isdir(path):
+		dir_list = [x.lower() for x in os.listdir(path)]
+		root, ext = os.path.splitext(name)
+		while name.lower() in dir_list:
+			name = root + '-' + str(i) + ext
+			i += 1
 	return name
 
 
