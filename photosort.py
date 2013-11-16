@@ -48,7 +48,7 @@ def main():
 	if len(args) == 0:
 		parser.print_help()
 		return
-	elif args[0] not in ('sort','fix','restore'):
+	elif args[0] not in ('sort','fix','restore','replace'):
 		parser.error("Invalid action provided")
 	elif args[0] in ('fix','restore') and len(args) == 2:
 		args.append(args[1])
@@ -61,7 +61,7 @@ def main():
 		
 	# ensure source and destination both exist and are directories
 	for path in (src, dest):
-		if not os.path.isdir(path):
+		if (action == 'replace' and not os.path.isfile(path)) or (action != 'replace' and not os.path.isdir(path)):
 			parser.error("No such file or directory '%s'" % path)
 	
 	# handle sort action
@@ -82,6 +82,10 @@ def main():
 	# handle fix action
 	if action == 'fix':
 		fix_images(src, dest, options.copy, options.verbose, options.test)
+	
+	# handle replace action
+	if action == 'replace':
+		replace_image(src, dest, options.copy, options.verbose)
 
 
 def sort_images(src, dest, src_bucket, copy=True, combine=True, trusted=True, preserve=True, verbose=True):
@@ -515,6 +519,97 @@ def fix_images(src, dest, copy=True, verbose=True, test=True):
 	log("------------------------")
 	log("%4d Total Files Processed" % tally['files'])
 	log("------------------------\n\n\n")
+
+
+def replace_image(src, dest, copy=True, verbose=True):
+	'''
+	transcribe dest file's name and mtime onto src and then replace dest
+	'''
+	
+	# ensure the source and destination exist
+	if not os.path.isfile(src) or not os.path.isfile(dest):
+		raise IOError('Source or destination directory not found')
+	
+	# get image metadata
+	srchash  = get_file_hash(src)[:6:]
+	srcmeta  = get_file_metadata(src)
+	destmeta = get_file_metadata(dest)
+	
+	# build new image filename
+	if not srcmeta or not destmeta:
+		raise IOError('Unable to process provided files')
+	
+	# parse directory structure for src and dest
+	srcfile  = os.path.basename(src)
+	destfile = os.path.basename(dest)
+	srcbase  = os.path.abspath(os.path.dirname(src))
+	destbase = os.path.abspath(os.path.dirname(dest))
+	srcpath  = ''
+	destpath = ''
+	srcmode  = ''
+	destmode = ''
+	
+	match = re.search(r'^(.*)(/exif|/noexif|/noimage)(/\d{4}/\d{2}|/unk|/low|/alt)$', srcbase)
+	if match:
+		srcbase = match.group(1)
+		srcmode = match.group(2)
+		srcpath = match.group(3)
+	srcbucket = os.path.basename(srcbase)
+	
+	match = re.search(r'^(.*)(/exif|/noexif|/noimage)(/\d{4}/\d{2}|/unk|/low|/alt)$', destbase)
+	if match:
+		destbase = match.group(1)
+		destmode = match.group(2)
+		destpath = match.group(3)
+	destbucket = os.path.basename(destbase)
+	
+	# generate our log closure
+	log = logger(destbase + '/_sort.log.txt', verbose)
+	
+	logfiles = []
+	if srcbase != destbase:
+		logfiles.append(srcbase + '/_sort.log.txt')
+	if srcpath:
+		logfiles.append(srcbase + srcmode + srcpath + '/_sort.log.txt')
+	if destpath and destbase + destmode + destpath != srcbase + srcmode + srcpath:
+		logfiles.append(destbase + destmode + destpath + '/_sort.log.txt')
+	
+	# generate our move closure
+	move = mover(copy)
+	
+	# scrape canonical name from dest and build a new filename
+	match = re.search(" \[([^\[]*)\]", destfile)
+	if match and destpath:
+		canon = match.group(1)
+		if srcmeta['date_taken']:
+			date = srcmeta['date_taken']
+		else:
+			date = destmeta['file']['mtime']
+		res = sorted((srcmeta['width'], srcmeta['height']))
+		
+		match = re.search("\]\.(.*?)\..+", srcfile)
+		if match:
+			srcbucket = match.group(1)
+		
+		newname = date.strftime('%Y.%m.%d %H.%M.%S-') + '%s %s' % (str(srcmeta['hdr']), srcmeta['signature'][0:4])
+		newname += ' %04dx%04d %s %s' % (res[1], res[0], srcmeta['status'], srchash)
+		newname += ' [%s].%s%s' % (canon, srcbucket, os.path.splitext(srcfile)[1].lower())
+	else:
+		newname = destname
+	
+	newname = unique_name(newname, destbase + destmode + destpath)
+	
+	# log and perform this action
+	log('', logfiles)
+	log('    Manual : %s/%s [MOVED TO] %s/%s' % (srcmode + srcpath, srcfile, destmode + destpath, newname), logfiles)
+	print
+	
+	move(src, destbase + destmode + destpath + '/' + newname)
+	shutil.copystat(dest, destbase + destmode + destpath + '/' + newname)
+	
+	if destpath and destpath != '/low':
+		log('             [REPLACED] %s/%s [TO] %s/%s' % (destmode + destpath, destfile, destmode + '/low', destfile), logfiles)
+		move(dest, destbase + destmode + '/low/' + destfile, False)
 
 
 def assert_dir(dirs, message=None):
