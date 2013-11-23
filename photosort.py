@@ -1,4 +1,8 @@
 #!/usr/bin/env python
+'''
+Copyright (c) 2013, Mike Greiling
+All rights reserved.
+'''
 
 import os, sys, re, glob, shutil, hashlib, subprocess
 from optparse import OptionParser
